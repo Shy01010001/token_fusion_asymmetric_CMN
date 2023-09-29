@@ -1,0 +1,12 @@
+[workspace]
+restore_data_on_startup = True
+save_data_on_exit = True
+save_history = True
+save_non_project_files = False
+project_type = 'empty-project-type'
+recent_files = ['run_iu_xray.sh', 'modules\\tokenizers.py', 'modules\\caption_model.py', 'modules\\att_model.py', 'models\\models.py', 'modules\\dataloaders.py', 'modules\\datasets.py', 'pycocoevalcap\\bleu\\bleu.py', 'modules\\base_cmn.py', 'modules\\trainer.py', 'main.py']
+
+[main]
+version = 0.2.0
+recent_files = []
+
