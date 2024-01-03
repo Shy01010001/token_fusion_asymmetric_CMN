@@ -24,6 +24,22 @@ from sklearn.preprocessing import MinMaxScaler
 
 from .att_model import pack_wrapper, AttModel
 
+class TokenFussion(nn.Module):
+    def __init__(self, d_model, num_classes, dropout = 0.1):
+        super(TokenFussion, self).__init__()
+        self.input_dimension = d_model // 8 # 8 head number
+        self.attn1 = nn.Sequential(nn.Linear(self.input_dimension, 2048), nn.ReLU(), nn.Dropout(dropout), nn.Linear(2048, num_classes), nn.ReLU())
+        self.norm = LayerNorm(512)
+    def forward(self, x):
+        x = rearrange(x, 'b p (h d) -> b h p d', h = 8) # head number = 8
+        s_x = self.attn1(x)
+        s_x = s_x.permute(0, 1, 3, 2)
+        s_x = rearrange(s_x, 'b h p d -> (b h) p d')
+        x = rearrange(x, 'b h p d -> (b h) p d')
+        x = torch.bmm(s_x, x)
+        x = rearrange(x, '(b h) p d -> b p (h d)', h = 8)
+        return x
+
 def min_max_normalize(tensor):
     min_val = torch.min(tensor)
     max_val = torch.max(tensor)
@@ -116,7 +132,7 @@ def memory_querying_responding(query, key, value, mask=None, dropout=None, topk=
     scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k) # [16, 8, 98, 2048] # 公式(7, 8) # D_s_i, D_t_i
     if mask is not None:
         scores = scores.masked_fill(mask==0, float('-inf'))
-    selected_scores, idx = scores.topk(32) # 选择最相关的K个记忆向量 # [16, 8, 98, 32(k)]
+    selected_scores, idx = scores.topk(topk) # 选择最相关的K个记忆向量 # [16, 8, 98, 32(k)]
     # print('all zeros jdge',scores.any())
     # torch.save(scores, 'scores.pt')
     # vmax = 1e-10
@@ -163,7 +179,9 @@ class SublayerConnection(nn.Module):
         self.norm = LayerNorm(size)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, sublayer):
+    def forward(self, x, sublayer, flag = 0):
+        if flag != 0:
+            return sublayer(self.norm(x))
         _x = sublayer(self.norm(x))
         if type(_x) is tuple:
             return x + self.dropout(_x[0]), _x[1]
@@ -181,7 +199,7 @@ class Embeddings(nn.Module):
 
 
 class MultiThreadMemory(nn.Module):
-    def __init__(self, head, d_model, dropout=0.1, topk=32):
+    def __init__(self, head, d_model, dropout=0.1, topk=1):
         super(MultiThreadMemory, self).__init__()
         assert d_model % head == 0
         self.d_k = d_model // head
@@ -290,12 +308,13 @@ class PositionalEncoding(nn.Module):
 class SemanticMap(nn.Module):
     def __init__(self, d_model, dropout = 0, execute_norm = True):
         super(SemanticMap, self).__init__()
-        self.attn = nn.Sequential(nn.Linear(512, 4096), nn.ReLU(), nn.Linear(4096, 512))
+        self.attn = nn.Sequential(nn.Linear(512, 2048), nn.ReLU(), nn.Linear(2048, 512))
         self.Tanh = nn.Tanh()
         self.tsne = tsne()
         self.execute_norm = execute_norm
         # self.SoftMax = nn.Softmax()
         self.norm = LayerNorm(512)
+        
     def forward(self, x, layer = 0):
         if self.execute_norm:
             x = self.norm(x)
@@ -306,10 +325,10 @@ class SemanticMap(nn.Module):
         return min_max_normalize(sm_x)
     
 class TokenFussion(nn.Module):
-    def __init__(self, d_model, num_classes, dropout = 0):
+    def __init__(self, d_model, num_classes, dropout = 0.1):
         super(TokenFussion, self).__init__()
         self.input_dimension = d_model // 8 # 8 head number
-        self.attn1 = nn.Sequential(nn.Linear(self.input_dimension, 4096), nn.ReLU(), nn.Linear(4096, num_classes), nn.Softmax())
+        self.attn1 = nn.Sequential(nn.Linear(self.input_dimension, 2048), nn.ReLU(), nn.Dropout(dropout), nn.Linear(2048, num_classes), nn.Sigmoid())
         self.norm = LayerNorm(512)
     def forward(self, x):
         x = rearrange(x, 'b p (h d) -> b h p d', h = 8) # head number = 8
@@ -319,19 +338,18 @@ class TokenFussion(nn.Module):
         x = rearrange(x, 'b h p d -> (b h) p d')
         x = torch.bmm(s_x, x)
         x = rearrange(x, '(b h) p d -> b p (h d)', h = 8)
-        return self.norm(x)
+        return x
 
 class EncoderLayer(nn.Module):
     def __init__(self, size, self_attn, feed_forward, dropout):
         super(EncoderLayer, self).__init__()
         self.self_attn = self_attn
         self.feed_forward = feed_forward
-        self.sublayer = clones(SublayerConnection(size, dropout), 2)
+        self.sublayer = clones(SublayerConnection(size, dropout), 3)
         self.size = size
-
     def forward(self, x, mask):
         x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask)) # attn: [batch_size, head, 98, 98]
-        return self.sublayer[1](x, self.feed_forward)
+        return self.sublayer[-1](x, self.feed_forward)
 
 
 class DecoderLayer(nn.Module):
@@ -343,7 +361,7 @@ class DecoderLayer(nn.Module):
         self.feed_forward = feed_forward
         self.sublayer = clones(SublayerConnection(size, dropout), 3)
 
-    def forward(self, x, memory, src_mask, tgt_mask, layer_past=None): # report词向量[batch_size, seq_len, d_model], encoder输出[batch_size, 98, d_model]
+    def forward(self, x, memory, src_mask, tgt_mask, layer_past=None, token_fusion = None): # report词向量[batch_size, seq_len, d_model], encoder输出[batch_size, 98, d_model]
         m = memory
         if layer_past is None: # train
             x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
@@ -362,15 +380,18 @@ class Encoder(nn.Module):
         self.layers = clones(layer, N) # N个encoder layer
         self.forget_gates = clones(SemanticMap(512, 0, False), N) ## 512 是feature token的dimensions
         self.norm = LayerNorm(layer.size)
+        self.token_fusion = TokenFussion(512, 20)
         # self.semantic_map1 = SemanticMap(512, 70)
         # self.semantic_map2 = SemanticMap(512, 60)
         # self.semantic_map3 = SemanticMap(512, 50)
 
     def forward(self, x, mask):
         # no_layer = 1
-        for layer, forget_gate in zip(self.layers, self.forget_gates):
-            
+        dummy = torch.zeros_like(x)
+        mesh = []
+        for layer in self.layers:
             x = layer(x, mask)
+            mesh.append(x)
             # gate = forget_gate(x, layer = no_layer)
             # x = gate * x
             # no_layer += 1
@@ -378,9 +399,15 @@ class Encoder(nn.Module):
                 # x = self.semantic_map(x)
             # outputs.append(x.unsqueeze(1))
             # flag += 1
+        fuses = self.token_fusion(x)
+        dummy[:, :20] = fuses
+        mesh.append(dummy)
+        mesh = torch.stack(mesh, dim = 0)
+
         # outputs = torch.cat(outputs, 1)
         # return outputs
-        return self.norm(x)
+        # return self.norm(x)
+        return mesh
 
 
 class Decoder(nn.Module):
@@ -419,7 +446,7 @@ class Transformer(nn.Module):
         self.cmn = cmn
 
     def forward(self, src, tgt, src_mask, tgt_mask, memory_matrix):
-        return self.decode(self.encode(src, src_mask), src_mask, tgt, tgt_mask, memory_matrix=memory_matrix)
+        return self.decode(self.encoder(src, src_mask), src_mask, tgt, tgt_mask, memory_matrix=memory_matrix)
 
     def encode(self, src, src_mask): # [batch_size, 98, d_model], [batch_size, 1, 98]
         # !!! mapping by disease classes
@@ -441,16 +468,75 @@ class Transformer(nn.Module):
 
         return self.decoder(embeddings, memory, src_mask, tgt_mask, past=past)
 
+class SrcMultiHeadedAttention(nn.Module):
+    def __init__(self, head, d_model, N, dropout=0.1):
+        super(SrcMultiHeadedAttention, self).__init__()
+        assert d_model % head == 0
+        self.d_k = d_model // head
+        self.h = head
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout)
+        self.layer_num = N + 1 # 魔鬼数字 1 1层 token fusion
+        self.query_map = clones(nn.Linear(d_model, d_model), 1)
+        self.key_map = clones(nn.Linear(d_model, d_model), 4) # 魔鬼数字 4 3层self attention + 1层 token fusion
+        self.value_map = clones(nn.Linear(d_model, d_model), 4) # 魔鬼数字 4 3层self attention + 1层 token fusion
+        self.sigma_map = clones(nn.Sequential(nn.Linear(2 * d_model, d_model), nn.Sigmoid()), self.layer_num) # 2d([Y, Attention(Y, Src)]) -> 1d
+        self.fw_map = clones(nn.Linear(d_model, d_model), 1)
+        self.norm = nn.LayerNorm(512)
+
+    def forward(self, query, key, value, mask=None, layer_past=None):
+        _query = query
+        # if mask is not None:
+        #     mask = mask.unsqueeze(1)
+        nbatches = query.size(0)
+        if layer_past is not None and layer_past.shape[2] == key.shape[1] > 1:
+            query = self.query_map[0](query)
+            key, value = layer_past[0], layer_past[1]
+            present = torch.stack([key, value])
+        else: 
+            query = self.query_map[0](query)
+            for lyr in range(self.layer_num):
+                key[:, lyr] = self.key_map[lyr](key[:, lyr])
+                value[:, lyr] = self.value_map[lyr](value[:, lyr])
+
+        if layer_past is not None and not (layer_past.shape[2] == key.shape[1] > 1):
+            past_key, past_value = layer_past[0], layer_past[1]
+            # print(key.size())
+            # print(value.size())            
+            key = torch.cat((past_key, key), dim=1)
+            value = torch.cat((past_value, value), dim=1)
+            # print(key.size())
+            # print(value.size())
+            
+            present = torch.stack([key, value])
+            # print(present.size())
+        query = query.view(nbatches, -1, self.h, self.d_k).transpose(1, 2).unsqueeze(1).repeat(1, key.size(1), 1, 1, 1)
+        key, value = [x.view(nbatches, self.layer_num, -1, self.h, self.d_k).transpose(2, 3) for x in [key, value]] # (batch_size, head, seq_len, dim_perhead)
+        x, self.attn = attention(query, key, value, mask=None, dropout=self.dropout)
+        x = x.transpose(2, 3).contiguous().view(nbatches, self.layer_num, -1, self.h * self.d_k)
+        query = query.transpose(2, 3).contiguous().view(nbatches, self.layer_num, -1, self.h * self.d_k)
+        sigma = torch.zeros_like(query)
+        for lyr in range(self.layer_num):
+            sigma[:, lyr] = self.sigma_map[lyr](torch.cat((_query, x[:, lyr]), dim = -1))
+        # print('qual?',torch.equal(query[:, 0], query[:, 1]))
+        # exit()
+        x = (torch.sum(sigma * x, dim = 1)) / np.sqrt(3) #### 1111!!!
+        # print('prensentL:',present.size())
+        if layer_past is not None:
+            return self.fw_map[0](x), present
+        else:
+            return self.fw_map[0](x)
 
 class BaseCMN(AttModel):
     def make_model(self, tgt_vocab, cmn):
         c = copy.deepcopy
         attn = MultiHeadedAttention(self.num_heads, self.d_model)
+        src_attn = SrcMultiHeadedAttention(self.num_heads, self.d_model, self.num_layers, dropout = self.dropout)
         ff = PositionwiseFeedForward(self.d_model, self.d_ff, self.dropout)
         position = PositionalEncoding(self.d_model, self.dropout)
         model = Transformer(
-            Encoder(EncoderLayer(self.d_model, c(attn), c(ff), self.dropout), self.num_layers),
-            Decoder(DecoderLayer(self.d_model, c(attn), c(attn), c(ff), self.dropout), self.num_layers),
+            Encoder(EncoderLayer(self.d_model, c(attn), c(ff), self.dropout), 3), # only 1 layer for image feature extraction
+            Decoder(DecoderLayer(self.d_model, c(attn), src_attn, c(ff), self.dropout), self.num_layers),
             nn.Sequential(c(position)), nn.Sequential(Embeddings(self.d_model, tgt_vocab), c(position)), cmn)
         for p in model.parameters():
             if p.dim() > 1:
@@ -468,14 +554,14 @@ class BaseCMN(AttModel):
         self. num_classes = args.num_classes
         self.dropout = args.dropout
         self.topk = args.topk
-        # self.norm = LayerNorm(512)
+        self.norm = nn.LayerNorm(512)
         self.tsne = tsne()
         
         tgt_vocab = self.vocab_size + 1
 
         # !!! mapping by disease classes
         self.semantic = SemanticMap(self.d_model, self.dropout)
-        self.token_fussion = TokenFussion(512, 80)
+        # self.token_fussion = TokenFussion(512, 20)
 
         # self.semantic = SemanticMap(self.d_model, 60, self.dropout)
         self.cmn = MultiThreadMemory(args.num_heads, args.d_model, topk=args.topk)
@@ -483,7 +569,8 @@ class BaseCMN(AttModel):
         self.model = self.make_model(tgt_vocab, self.cmn)
         self.logit = nn.Linear(args.d_model, tgt_vocab)
 
-        self.memory_matrix = nn.Parameter(torch.FloatTensor(args.d_vf, args.cmm_dim)) # 多模态记忆 memory matrix
+        # self.memory_matrix = nn.Parameter(torch.FloatTensor(args.d_vf, args.cmm_dim)) # 多模态记忆 memory matrix
+        self.memory_matrix = nn.Parameter(torch.FloatTensor(98 * 4, args.cmm_dim))
         nn.init.normal_(self.memory_matrix, 0, 1 / args.cmm_dim)
 
     def init_hidden(self, bsz):
@@ -491,6 +578,7 @@ class BaseCMN(AttModel):
 
     def _prepare_feature(self, fc_feats, att_feats, att_masks):
         att_feats, seq, att_masks, seq_mask = self._prepare_feature_forward(att_feats, att_masks)
+        att_masks = None
         memory = self.model.encode(att_feats, att_masks)
 
         return fc_feats[..., :1], att_feats[..., :1], memory, att_masks
@@ -499,27 +587,26 @@ class BaseCMN(AttModel):
         att_feats, att_masks = self.clip_att(att_feats, att_masks)
         att_feats = pack_wrapper(self.att_embed, att_feats, att_masks) # [batch_size, 98, d_model]
         # !!! mapping by disease classes
-
-
-        forget_gate = self.semantic(att_feats)
+        image_memory_matrix = self.memory_matrix.view(98, 4, -1) # 20 融合之后的token数
+        dummy_memory_matrix = image_memory_matrix.unsqueeze(0)
+        dummy_memory_matrix = torch.sum(dummy_memory_matrix, dim = 2)
+        att_feats = (att_feats + dummy_memory_matrix/4) / np.sqrt(2)
+        # forget_gate = self.semantic(att_feats)
         
-        att_feats = forget_gate * att_feats
-        self.tsne.run(att_feats, 'l')
-        att_feats = self.token_fussion(att_feats)
+        # att_feats = forget_gate * att_feats
+        # self.tsne.run(att_feats, 'l')
+        # dummy_memory_matrix = self.memory_matrix.unsqueeze(0).expand(att_feats.size(0), self.memory_matrix.size(0),
+        #                                                               self.memory_matrix.size(1)) # [batch_size, cmm_size, cmm_dim]
+        # responses = self.cmn(att_feats, dummy_memory_matrix, dummy_memory_matrix) # [batch_size, 98, d_model]    
+        # att_feats = att_feats + responses
         # Memory querying and responding for visual features
-        # image_memory_matrix = self.memory_matrix.view(20, 32, -1) # 20 融合之后的token数
-        dummy_memory_matrix = self.memory_matrix.unsqueeze(0).expand(att_feats.size(0), self.memory_matrix.size(0),
-                                                                      self.memory_matrix.size(1)) # [batch_size, cmm_size, cmm_dim]
-        responses = self.cmn(att_feats, dummy_memory_matrix, dummy_memory_matrix) # [batch_size, 98, d_model]
-        # dummy_memory_matrix = image_memory_matrix.unsqueeze(0)
-        # dummy_memory_matrix = torch.sum(dummy_memory_matrix, dim = 2)
-        # att_feats = att_feats + dummy_memory_matrix/32
+
         # Memory querying and responding for visual features
-        att_feats = att_feats + responses
+        
         
         
         if att_masks is None:
-            att_masks = att_feats.new_ones(att_feats.shape[:2], dtype=torch.long) # [batch_size, 98]
+            att_masks = att_feats.new_ones(50, dtype=torch.long) # [batch_size, 98]  50 is the number of fused token
         att_masks = att_masks.unsqueeze(-2) # [batch_size, 98, 1]
         if seq is not None:
             seq = seq[:, :-1] # [batch_size, max_seq_len-1]
@@ -547,6 +634,7 @@ class BaseCMN(AttModel):
         # print(seq.size())
         # print(seq_mask.size())
         # exit()
+        att_masks = None
         out = self.model(att_feats, seq, att_masks, seq_mask, memory_matrix=self.memory_matrix) # [batch_size, seq_len, d_model]
         outputs = F.log_softmax(self.logit(out), dim=-1) # [batch_size, max_seq_len-1, vocab_size+1]
 
@@ -554,12 +642,11 @@ class BaseCMN(AttModel):
 
     def core(self, it, fc_feats_ph, att_feats_ph, memory, state, mask):
         if len(state) == 0:
-            ys = it.unsqueeze(1) # [batch_size, 1, emb_dim]
+            ys = it.unsqueeze(1)
             past = [fc_feats_ph.new_zeros(self.num_layers * 2, fc_feats_ph.shape[0], 0, self.d_model),
-                    fc_feats_ph.new_zeros(self.num_layers * 2, fc_feats_ph.shape[0], 0, self.d_model)]
+                    fc_feats_ph.new_zeros(self.num_layers * 2, fc_feats_ph.shape[0], 0, 98, self.d_model)]
         else:
             ys = torch.cat([state[0][0], it.unsqueeze(1)], dim=1)
             past = state[1:]
-        out, past = self.model.decode(memory, mask, ys, subsequent_mask(ys.size(1)).to(memory.device),
-                                      past=past, memory_matrix=self.memory_matrix)
+        out, past = self.model.decode(memory, mask, ys, subsequent_mask(ys.size(1)).to(memory.device), past=past)
         return out[:, -1], [ys.unsqueeze(0)] + past
