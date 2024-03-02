@@ -267,7 +267,7 @@ class Trainer(BaseTrainer):
                 set_flag.set_image_id()
                 # break
             # !!! print generated and ground-truth reports
-            f_res = open(f'records/reports_tanh_{epoch}.txt', 'w')
+            f_res = open(f'records/asy_{epoch}.txt', 'w')
             for line in test_res:
                 f_res.write(line+'\n')
             f_res.close()

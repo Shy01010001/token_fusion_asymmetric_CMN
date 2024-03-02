@@ -392,10 +392,10 @@ class Encoder(nn.Module):
     def forward(self, x, mask):
         # no_layer = 1
         dummy = torch.zeros_like(x)
-        mesh = []
+        # mesh = []
         for layer in self.layers:
             x = layer(x, mask)
-            mesh.append(x)
+            # mesh.append(x)
             # gate = forget_gate(x, layer = no_layer)
             # x = gate * x
             # no_layer += 1
@@ -403,13 +403,13 @@ class Encoder(nn.Module):
                 # x = self.semantic_map(x)
             # outputs.append(x.unsqueeze(1))
             # flag += 1
-        fuses = self.token_fusion(x)
-        dummy[:, :20] = fuses.clone()
+        # fuses = self.token_fusion(x)
+        # dummy[:, :20] = fuses.clone()
         # pdb.set_trace()
-        mesh.append(dummy)
-        mesh = torch.stack(mesh, dim = 0)
-        mesh = mesh.transpose(0, 1)
-        return mesh
+        # mesh.append(dummy)
+        # mesh = torch.stack(mesh, dim = 0)
+        # mesh = mesh.transpose(0, 1)
+        return x
 
 
 class Decoder(nn.Module):
@@ -551,7 +551,7 @@ class BaseCMN(AttModel):
         position = PositionalEncoding(self.d_model, self.dropout)
         model = Transformer(
             Encoder(EncoderLayer(self.d_model, c(attn), c(ff), self.dropout), 3), # only 1 layer for image feature extraction
-            Decoder(DecoderLayer(self.d_model, c(attn), src_attn, c(ff), self.dropout), self.num_layers),
+            Decoder(DecoderLayer(self.d_model, c(attn), c(attn), c(ff), self.dropout), self.num_layers),
             nn.Sequential(c(position)), nn.Sequential(Embeddings(self.d_model, tgt_vocab), c(position)), cmn)
         for p in model.parameters():
             if p.dim() > 1:
@@ -650,7 +650,7 @@ class BaseCMN(AttModel):
         # print(seq_mask.size())
         # exit()
         att_masks = None
-        pdb.set_trace()
+        # pdb.set_trace()
         out = self.model(att_feats, seq, att_masks, seq_mask, memory_matrix=self.memory_matrix) # [batch_size, seq_len, d_model]
         outputs = F.log_softmax(self.logit(out), dim=-1) # [batch_size, max_seq_len-1, vocab_size+1]
 
@@ -660,9 +660,9 @@ class BaseCMN(AttModel):
         if len(state) == 0:
             ys = it.unsqueeze(1)
             past = [fc_feats_ph.new_zeros(self.num_layers * 2, fc_feats_ph.shape[0], 0, self.d_model),
-                    fc_feats_ph.new_zeros(self.num_layers * 2, fc_feats_ph.shape[0], 0, 98, self.d_model)]
+                    fc_feats_ph.new_zeros(self.num_layers * 2, fc_feats_ph.shape[0], 0, self.d_model)]
         else:
             ys = torch.cat([state[0][0], it.unsqueeze(1)], dim=1)
             past = state[1:]
-        out, past = self.model.decode(memory, mask, ys, subsequent_mask(ys.size(1)).to(memory.device), past=past)
+        out, past = self.model.decode(memory, mask, ys, subsequent_mask(ys.size(1)).to(memory.device), past=past, memory_matrix=self.memory_matrix)
         return out[:, -1], [ys.unsqueeze(0)] + past
