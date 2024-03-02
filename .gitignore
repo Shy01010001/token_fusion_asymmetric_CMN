@@ -1,0 +1,6 @@
+results/
+loss/
+evaluation/
+tsne/
+records/
+*.json
