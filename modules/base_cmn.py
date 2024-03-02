@@ -23,6 +23,9 @@ from sklearn.manifold import TSNE
 from sklearn.preprocessing import MinMaxScaler
 
 from .att_model import pack_wrapper, AttModel
+import pdb
+
+torch.autograd.set_detect_anomaly(True)
 
 class TokenFussion(nn.Module):
     def __init__(self, d_model, num_classes, dropout = 0.1):
@@ -365,6 +368,7 @@ class DecoderLayer(nn.Module):
         m = memory
         if layer_past is None: # train
             x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, tgt_mask))
+            # pdb.set_trace()
             x = self.sublayer[1](x, lambda x: self.src_attn(x, m, m, src_mask))
             return self.sublayer[2](x, self.feed_forward) # [batch_size, seq_len, d_model]
         else: # sample
@@ -400,13 +404,11 @@ class Encoder(nn.Module):
             # outputs.append(x.unsqueeze(1))
             # flag += 1
         fuses = self.token_fusion(x)
-        dummy[:, :20] = fuses
+        dummy[:, :20] = fuses.clone()
+        # pdb.set_trace()
         mesh.append(dummy)
         mesh = torch.stack(mesh, dim = 0)
-
-        # outputs = torch.cat(outputs, 1)
-        # return outputs
-        # return self.norm(x)
+        mesh = mesh.transpose(0, 1)
         return mesh
 
 
@@ -424,7 +426,9 @@ class Decoder(nn.Module):
             past = list(zip(past[0].split(2, dim=0), past[1].split(2, dim=0)))
         else:
             past = [None] * len(self.layers) # [None, None, None], num_layers
+        # pdb.set_trace()
         for i, (layer, layer_past) in enumerate(zip(self.layers, past)):
+            # pdb.set_trace()
             x = layer(x, memory, src_mask, tgt_mask, layer_past) # [batch_size, seq_len, d_model]
             if layer_past is not None:
                 present[0].append(x[1][0])
@@ -478,13 +482,14 @@ class SrcMultiHeadedAttention(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
         self.layer_num = N + 1 # 魔鬼数字 1 1层 token fusion
         self.query_map = clones(nn.Linear(d_model, d_model), 1)
-        self.key_map = clones(nn.Linear(d_model, d_model), 4) # 魔鬼数字 4 3层self attention + 1层 token fusion
-        self.value_map = clones(nn.Linear(d_model, d_model), 4) # 魔鬼数字 4 3层self attention + 1层 token fusion
+        self.key_map = clones(nn.Linear(d_model, d_model), self.layer_num) # 魔鬼数字 4 3层self attention + 1层 token fusion
+        self.value_map = clones(nn.Linear(d_model, d_model), self.layer_num) # 魔鬼数字 4 3层self attention + 1层 token fusion
         self.sigma_map = clones(nn.Sequential(nn.Linear(2 * d_model, d_model), nn.Sigmoid()), self.layer_num) # 2d([Y, Attention(Y, Src)]) -> 1d
         self.fw_map = clones(nn.Linear(d_model, d_model), 1)
         self.norm = nn.LayerNorm(512)
 
     def forward(self, query, key, value, mask=None, layer_past=None):
+        
         _query = query
         # if mask is not None:
         #     mask = mask.unsqueeze(1)
@@ -510,22 +515,32 @@ class SrcMultiHeadedAttention(nn.Module):
             
             present = torch.stack([key, value])
             # print(present.size())
+
         query = query.view(nbatches, -1, self.h, self.d_k).transpose(1, 2).unsqueeze(1).repeat(1, key.size(1), 1, 1, 1)
+        # pdb.set_trace()
         key, value = [x.view(nbatches, self.layer_num, -1, self.h, self.d_k).transpose(2, 3) for x in [key, value]] # (batch_size, head, seq_len, dim_perhead)
-        x, self.attn = attention(query, key, value, mask=None, dropout=self.dropout)
-        x = x.transpose(2, 3).contiguous().view(nbatches, self.layer_num, -1, self.h * self.d_k)
+        # key[:, self.layer_num - 1, :, 20:] = key[:, self.layer_num - 1, :, 20:].detach()
+        # value[:, self.layer_num - 1, :, 20:] = value[:, self.layer_num - 1, :, 20:].detach()
+        
+        x, _ = attention(query[:, : self.layer_num - 1], key[:, : self.layer_num - 1], value[:, : self.layer_num - 1], mask=None, dropout=self.dropout)
+        x1, _ = attention(query[:, self.layer_num - 1], key[:, self.layer_num - 1, :, : 20], value[:, self.layer_num - 1, :, : 20], mask=None, dropout=self.dropout)
+        
+        x1 = x1.unsqueeze(1)
+        
+        new_x = torch.cat((x, x1), dim = 1)
+        new_x = new_x.transpose(2, 3).contiguous().view(nbatches, self.layer_num, -1, self.h * self.d_k)
         query = query.transpose(2, 3).contiguous().view(nbatches, self.layer_num, -1, self.h * self.d_k)
         sigma = torch.zeros_like(query)
         for lyr in range(self.layer_num):
-            sigma[:, lyr] = self.sigma_map[lyr](torch.cat((_query, x[:, lyr]), dim = -1))
+            sigma[:, lyr] = self.sigma_map[lyr](torch.cat((_query, new_x[:, lyr]), dim = -1))
         # print('qual?',torch.equal(query[:, 0], query[:, 1]))
         # exit()
-        x = (torch.sum(sigma * x, dim = 1)) / np.sqrt(3) #### 1111!!!
+        new_x = (torch.sum(sigma * new_x, dim = 1)) / np.sqrt(4) #### 4 是encoder层数 + 1层 token fusion
         # print('prensentL:',present.size())
         if layer_past is not None:
-            return self.fw_map[0](x), present
+            return self.fw_map[0](new_x), present
         else:
-            return self.fw_map[0](x)
+            return self.fw_map[0](new_x)
 
 class BaseCMN(AttModel):
     def make_model(self, tgt_vocab, cmn):
@@ -635,6 +650,7 @@ class BaseCMN(AttModel):
         # print(seq_mask.size())
         # exit()
         att_masks = None
+        pdb.set_trace()
         out = self.model(att_feats, seq, att_masks, seq_mask, memory_matrix=self.memory_matrix) # [batch_size, seq_len, d_model]
         outputs = F.log_softmax(self.logit(out), dim=-1) # [batch_size, max_seq_len-1, vocab_size+1]
 

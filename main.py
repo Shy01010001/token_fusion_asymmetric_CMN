@@ -13,7 +13,7 @@ from modules.tokenizers import Tokenizer
 from modules.trainer import Trainer
 # from modules.base_cmn import get_dict
 # import json
-
+TF_ENABLE_ONEDNN_OPTS=0
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
@@ -41,7 +41,7 @@ def parse_args():
 
     # Model settings (for Transformer)
     parser.add_argument('--d_model', type=int, default=512, help='the dimension of Transformer')
-    parser.add_argument('--d_ff', type=int, default=512, help='the dimension of FFN')
+    parser.add_argument('--d_ff', type=int, default=2048, help='the dimension of FFN')
     parser.add_argument('--d_vf', type=int, default=2048, help='the dimension of the patch features')
     parser.add_argument('--num_heads', type=int, default=8, help='the number of heads in Transformer')
     parser.add_argument('--num_layers', type=int, default=3, help='the number of layers of Transformer')
@@ -59,7 +59,7 @@ def parse_args():
     parser.add_argument('--num_diseases_per_organ', type=int, default=8, help='the number diseases per organ')
 
     # for Cross-modal Memory
-    parser.add_argument('--topk', type=int, default=32, help='the number of k')
+    parser.add_argument('--topk', type=int, default=1, help='the number of k')
     parser.add_argument('--cmm_size', type=int, default=2048, help='cmm size')
     parser.add_argument('--cmm_dim', type=int, default=512, help='cmm dimension')
 
@@ -102,7 +102,7 @@ def parse_args():
 
     # Others
     parser.add_argument('--seed', type=int, default=9233, help='.')
-    # parser.add_argument('--resume', type=str, default = './results/iu_xray/checkpoint_epoch_100.pth', help='whether to resume the training from existing checkpoints')
+    # parser.add_argument('--resume', type=str, default = './results/iu_xray/checkpoint_epoch_58.pth', help='whether to resume the training from existing checkpoints')
     parser.add_argument('--resume', type=str, help='whether to resume the training from existing checkpoints')
 # 
     args = parser.parse_args()
